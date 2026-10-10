@@ -1,0 +1,7 @@
+cd E:\FYP\ORCA_UI_FEATURE\backend
+
+uvicorn main:app --reload
+
+cd E:\FYP\ORCA_UI_FEATURE\frontend
+
+npm run dev

@@ -16,11 +16,13 @@ import {
   ShieldCheck,
   ChevronRight,
   Waypoints,
+  Loader2,
 } from "lucide-react";
 import Topbar from "../components/Topbar";
 import { useProjects } from "../context/ProjectsContext";
 import { statusToneClasses } from "../data/seed";
 import { timeAgo, cn } from "../lib/utils";
+import { joinMeeting, detectPlatform } from "../api/botApi"; // ✅ NEW
 
 const AVATAR_TINTS = [
   "bg-indigo-100 text-indigo-700",
@@ -35,6 +37,8 @@ export default function ProjectDetail() {
   const project = getProject(id);
   const [meetingUrl, setMeetingUrl] = useState("");
   const [tab, setTab] = useState("Overview");
+  const [launching, setLaunching] = useState(false); // ✅ NEW
+  const [launchStatus, setLaunchStatus] = useState(null); // ✅ NEW
 
   if (!project) {
     return (
@@ -57,10 +61,36 @@ export default function ProjectDetail() {
 
   const isEmpty = !project.initialized;
 
-  function handleLaunch() {
-    if (!meetingUrl.trim()) return;
-    launchMeeting(project.id, meetingUrl.trim());
-    setMeetingUrl("");
+  // ✅ UPDATED: ab Vexa ko call karta hai
+  async function handleLaunch() {
+    if (!meetingUrl.trim() || launching) return;
+
+    const url = meetingUrl.trim();
+    const platform = detectPlatform(url);
+
+    setLaunching(true);
+    setLaunchStatus(null);
+
+    try {
+      // 1. Vexa bot ko meeting mein bhejo
+      const data = await joinMeeting({ platform, meetingUrl: url });
+
+      // 2. Local state update karo (project ke andar meeting log)
+      launchMeeting(project.id, url);
+
+      setLaunchStatus({
+        type: "success",
+        text: data.message || "Sphere bot meeting join kar raha hai!",
+      });
+      setMeetingUrl("");
+
+      // 5 second baad status clear
+      setTimeout(() => setLaunchStatus(null), 5000);
+    } catch (err) {
+      setLaunchStatus({ type: "error", text: err.message });
+    } finally {
+      setLaunching(false);
+    }
   }
 
   const tabs = [
@@ -128,18 +158,42 @@ export default function ProjectDetail() {
                 onChange={(e) => setMeetingUrl(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleLaunch()}
                 placeholder="https://meet.google.com/xyz-abcd-efg or Zoom link..."
-                className="w-full bg-transparent text-[13.5px] text-ink-950 placeholder:text-ink-950/40 focus:outline-none"
+                disabled={launching}
+                className="w-full bg-transparent text-[13.5px] text-ink-950 placeholder:text-ink-950/40 focus:outline-none disabled:opacity-60"
               />
             </div>
             <button
               onClick={handleLaunch}
-              disabled={!meetingUrl.trim()}
+              disabled={!meetingUrl.trim() || launching}
               className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-white px-5 py-3 text-[13.5px] font-semibold text-ink-950 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {isEmpty ? "Launch First Meeting" : "Launch Meeting Stage"}
-              <ArrowRight size={15} />
+              {launching ? (
+                <>
+                  <Loader2 size={15} className="animate-spin" />
+                  Launching...
+                </>
+              ) : (
+                <>
+                  {isEmpty ? "Launch First Meeting" : "Launch Meeting Stage"}
+                  <ArrowRight size={15} />
+                </>
+              )}
             </button>
           </div>
+
+          {/* ✅ Status message */}
+          {launchStatus && (
+            <div
+              className={cn(
+                "mt-3 rounded-lg border p-3 text-[12.5px]",
+                launchStatus.type === "success"
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                  : "border-red-500/30 bg-red-500/10 text-red-200"
+              )}
+            >
+              {launchStatus.text}
+            </div>
+          )}
 
           {isEmpty ? (
             <p className="mt-3.5 text-[11.5px] text-white/40">
