@@ -1,28 +1,16 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import {
-  Video,
-  ArrowRight,
-  Mic,
-  Radio,
-  Clock3,
-  CheckSquare,
-  HeartPulse,
-  MessagesSquare,
-  GitPullRequest,
-  Boxes,
-  Ticket,
-  History,
-  ShieldCheck,
-  ChevronRight,
-  Waypoints,
-  Loader2,
+  Video, ArrowRight, Mic, Radio, Clock3, CheckSquare, HeartPulse,
+  MessagesSquare, GitPullRequest, Boxes, Ticket, History, ShieldCheck,
+  ChevronRight, Waypoints, Loader2,
 } from "lucide-react";
 import Topbar from "../components/Topbar";
 import { useProjects } from "../context/ProjectsContext";
 import { statusToneClasses } from "../data/seed";
 import { timeAgo, cn } from "../lib/utils";
-import { joinMeeting, detectPlatform } from "../api/botApi"; // ✅ NEW
+import { joinMeeting, detectPlatform, leaveMeetingNative } from "../api/botApi";
+import { connectTranscript } from "../api/transcriptApi";
 
 const AVATAR_TINTS = [
   "bg-indigo-100 text-indigo-700",
@@ -35,10 +23,40 @@ export default function ProjectDetail() {
   const navigate = useNavigate();
   const { getProject, launchMeeting } = useProjects();
   const project = getProject(id);
+
   const [meetingUrl, setMeetingUrl] = useState("");
   const [tab, setTab] = useState("Overview");
-  const [launching, setLaunching] = useState(false); // ✅ NEW
-  const [launchStatus, setLaunchStatus] = useState(null); // ✅ NEW
+
+  const [launching, setLaunching] = useState(false);
+  const [launchStatus, setLaunchStatus] = useState(null);
+
+  const [botActive, setBotActive] = useState(false);
+  const [activePlatform, setActivePlatform] = useState(null);
+  const [activeNativeId, setActiveNativeId] = useState(null);
+  const [liveSegments, setLiveSegments] = useState([]);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+  const [countdown, setCountdown] = useState(0);
+
+  const wsRef = useRef(null);
+  const transcriptEndRef = useRef(null);
+
+  // Auto-scroll transcript
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [liveSegments]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, []);
+
+  // ❌ Polling DISABLED — REST API 403 de raha hai, WebSocket hi kaafi hai
 
   if (!project) {
     return (
@@ -61,9 +79,31 @@ export default function ProjectDetail() {
 
   const isEmpty = !project.initialized;
 
-  // ✅ UPDATED: ab Vexa ko call karta hai
+  async function waitWithCountdown(seconds, message) {
+    for (let i = seconds; i > 0; i--) {
+      setCountdown(i);
+      setLaunchStatus({ type: "success", text: `${message} (${i}s)` });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    setCountdown(0);
+  }
+
+  // ✅ Helper: segment ko merge karo
+  function mergeSegment(prev, seg) {
+    const id = seg.segment_id || seg.id;
+    if (!id) return [...prev, seg];
+
+    const idx = prev.findIndex((s) => (s.segment_id || s.id) === id);
+    if (idx >= 0) {
+      const updated = [...prev];
+      updated[idx] = seg;   // replace (draft → final)
+      return updated;
+    }
+    return [...prev, seg];
+  }
+
   async function handleLaunch() {
-    if (!meetingUrl.trim() || launching) return;
+    if (!meetingUrl.trim() || launching || botActive) return;
 
     const url = meetingUrl.trim();
     const platform = detectPlatform(url);
@@ -72,25 +112,122 @@ export default function ProjectDetail() {
     setLaunchStatus(null);
 
     try {
-      // 1. Vexa bot ko meeting mein bhejo
       const data = await joinMeeting({ platform, meetingUrl: url });
+      const nativeId = data.native_meeting_id;
 
-      // 2. Local state update karo (project ke andar meeting log)
       launchMeeting(project.id, url);
+
+      setBotActive(true);
+      setActivePlatform(platform);
+      setActiveNativeId(nativeId);
+      setLiveSegments([]);
+
+      await waitWithCountdown(20, "Bot meeting mein join kar raha hai... please wait");
 
       setLaunchStatus({
         type: "success",
-        text: data.message || "Sphere bot meeting join kar raha hai!",
+        text: "Connecting to live transcript...",
       });
-      setMeetingUrl("");
 
-      // 5 second baad status clear
-      setTimeout(() => setLaunchStatus(null), 5000);
+      if (nativeId) {
+        const ws = connectTranscript(
+          platform,
+          nativeId,
+          (msg) => {
+            console.log("📩 WS message:", msg);
+
+            if (msg.type === "error") {
+              console.error("Transcript error:", msg.error);
+              return;
+            }
+
+            // ✅ Vexa WebSocket format — SINGLE SEGMENT
+            if (msg.type === "transcript" && msg.segment) {
+              setLiveSegments((prev) => mergeSegment(prev, msg.segment));
+              return;
+            }
+
+            // ✅ Vexa WebSocket format — CONFIRMED + PENDING
+            if (msg.type === "transcript" && (msg.confirmed || msg.pending)) {
+              const allSegs = [
+                ...(msg.confirmed || []),
+                ...(msg.pending || []),
+              ];
+              setLiveSegments((prev) => {
+                let merged = [...prev];
+                allSegs.forEach((seg) => {
+                  merged = mergeSegment(merged, seg);
+                });
+                return merged;
+              });
+              return;
+            }
+
+            // ✅ Fallback: segments array (agar future mein aaye)
+            if (msg.segments && Array.isArray(msg.segments)) {
+              setLiveSegments((prev) => {
+                let merged = [...prev];
+                msg.segments.forEach((seg) => {
+                  merged = mergeSegment(merged, seg);
+                });
+                return merged;
+              });
+            }
+          },
+          (err) => {
+            console.error("WS error:", err);
+            setWsConnected(false);
+          }
+        );
+
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          setWsConnected(true);
+          setLaunchStatus({
+            type: "success",
+            text: "✅ Live! Ab meeting mein bolo — transcript aa jayegi.",
+          });
+          setTimeout(() => setLaunchStatus(null), 5000);
+        };
+
+        ws.onclose = () => setWsConnected(false);
+      }
     } catch (err) {
       setLaunchStatus({ type: "error", text: err.message });
     } finally {
       setLaunching(false);
     }
+  }
+
+  async function handleLeave() {
+    if (!botActive) return;
+
+    setLeaving(true);
+
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setWsConnected(false);
+
+    try {
+      if (activePlatform && activeNativeId) {
+        await leaveMeetingNative({
+          platform: activePlatform,
+          nativeMeetingId: activeNativeId,
+        });
+      }
+    } catch (err) {
+      console.error("Leave error:", err);
+    }
+
+    setBotActive(false);
+    setActivePlatform(null);
+    setActiveNativeId(null);
+    setLeaving(false);
+    setLaunchStatus({ type: "success", text: "Bot left the meeting." });
+    setTimeout(() => setLaunchStatus(null), 4000);
   }
 
   const tabs = [
@@ -135,14 +272,19 @@ export default function ProjectDetail() {
           {project.description}
         </p>
 
-        {/* Enter Meeting URL */}
         <div className="mt-6 rounded-card bg-ink-950 p-7 text-white">
           <span className="flex items-center gap-1.5 text-[11px] font-medium text-white/60">
             <Radio size={12} className="animate-pulse" />
-            {isEmpty ? "INSTANT NEURAL INGESTION" : "LIVE AUTONOMOUS SYNTHESIZER"}
+            {botActive
+              ? "LIVE · BOT IN MEETING"
+              : isEmpty
+              ? "INSTANT NEURAL INGESTION"
+              : "LIVE AUTONOMOUS SYNTHESIZER"}
           </span>
-          <h2 className="mt-2 text-[22px] font-bold">Enter Meeting URL</h2>
-          {isEmpty && (
+          <h2 className="mt-2 text-[22px] font-bold">
+            {botActive ? "Sphere is Listening" : "Enter Meeting URL"}
+          </h2>
+          {isEmpty && !botActive && (
             <p className="mt-1.5 max-w-md text-[13.5px] leading-relaxed text-white/60">
               Initiate your first meeting to populate this repository with
               architecture schemas, diarized decisions, and auto-generated
@@ -158,30 +300,40 @@ export default function ProjectDetail() {
                 onChange={(e) => setMeetingUrl(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleLaunch()}
                 placeholder="https://meet.google.com/xyz-abcd-efg or Zoom link..."
-                disabled={launching}
+                disabled={launching || botActive}
                 className="w-full bg-transparent text-[13.5px] text-ink-950 placeholder:text-ink-950/40 focus:outline-none disabled:opacity-60"
               />
             </div>
-            <button
-              onClick={handleLaunch}
-              disabled={!meetingUrl.trim() || launching}
-              className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-white px-5 py-3 text-[13.5px] font-semibold text-ink-950 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {launching ? (
-                <>
-                  <Loader2 size={15} className="animate-spin" />
-                  Launching...
-                </>
-              ) : (
-                <>
-                  {isEmpty ? "Launch First Meeting" : "Launch Meeting Stage"}
-                  <ArrowRight size={15} />
-                </>
-              )}
-            </button>
+
+            {!botActive ? (
+              <button
+                onClick={handleLaunch}
+                disabled={!meetingUrl.trim() || launching}
+                className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-white px-5 py-3 text-[13.5px] font-semibold text-ink-950 transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {launching ? (
+                  <>
+                    <Loader2 size={15} className="animate-spin" />
+                    {countdown > 0 ? `Waiting ${countdown}s...` : "Launching..."}
+                  </>
+                ) : (
+                  <>
+                    {isEmpty ? "Launch First Meeting" : "Launch Meeting Stage"}
+                    <ArrowRight size={15} />
+                  </>
+                )}
+              </button>
+            ) : (
+              <button
+                onClick={handleLeave}
+                disabled={leaving}
+                className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-rose-600 px-5 py-3 text-[13.5px] font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                {leaving ? "Leaving..." : "Leave Meeting"}
+              </button>
+            )}
           </div>
 
-          {/* ✅ Status message */}
           {launchStatus && (
             <div
               className={cn(
@@ -195,7 +347,7 @@ export default function ProjectDetail() {
             </div>
           )}
 
-          {isEmpty ? (
+          {isEmpty && !botActive ? (
             <p className="mt-3.5 text-[11.5px] text-white/40">
               Supported bridges:{" "}
               {["Google Meet", "Zoom Rooms", "Microsoft Teams", "Raw SIP/WebRTC"].map(
@@ -207,14 +359,85 @@ export default function ProjectDetail() {
                 )
               )}
             </p>
-          ) : (
-            <button className="mt-3.5 flex items-center gap-1.5 text-[12.5px] font-medium text-white/70 hover:text-white">
-              <Mic size={13} /> Start Instant Audio Room
-            </button>
-          )}
+          ) : null}
         </div>
 
-        {/* Tabs */}
+        {botActive && (
+          <div className="mt-6 rounded-card border border-line bg-white p-6">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "h-2.5 w-2.5 rounded-full",
+                    wsConnected || liveSegments.length > 0
+                      ? "bg-red-500 animate-pulse"
+                      : "bg-ink-950/30"
+                  )}
+                />
+                <h3 className="text-[15px] font-semibold text-ink-950">
+                  Live Transcript
+                </h3>
+                <span className="rounded-pill bg-canvas px-2 py-0.5 text-[11px] font-medium text-ink-950/60">
+                  {liveSegments.length > 0
+                    ? "Streaming"
+                    : wsConnected
+                    ? "Connected"
+                    : countdown > 0
+                    ? "Waiting..."
+                    : "Connecting..."}
+                </span>
+              </div>
+              <span className="text-[12px] text-ink-950/45">
+                {liveSegments.length} segments
+              </span>
+            </div>
+
+            <div className="mt-4 max-h-[420px] overflow-y-auto flex flex-col gap-2.5 pr-1">
+              {liveSegments.length === 0 && (
+                <p className="py-10 text-center text-[13px] text-ink-950/40">
+                  {countdown > 0
+                    ? `Bot ko join karne ka time de rahe hain... ${countdown}s`
+                    : "Waiting for speech... start talking. (Also ADMIT the bot in Google Meet)"}
+                </p>
+              )}
+
+              {liveSegments.map((seg, i) => (
+                <div
+                  key={seg.segment_id || seg.id || i}
+                  className={cn(
+                    "flex flex-col gap-1 rounded-lg p-3 transition-colors",
+                    seg.completed
+                      ? "bg-canvas"
+                      : "border border-amber-200 bg-amber-50"
+                  )}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12.5px] font-semibold text-ink-950">
+                      {seg.speaker || "Speaker"}
+                    </span>
+                    <span className="text-[11px] text-ink-950/40">
+                      {seg.completed ? "✓ final" : "… live"}
+                      {typeof seg.start === "number" &&
+                        ` · ${seg.start.toFixed(1)}s`}
+                    </span>
+                  </div>
+                  <p
+                    className={cn(
+                      "text-[13.5px] leading-relaxed",
+                      seg.completed
+                        ? "text-ink-950/75"
+                        : "italic text-ink-950/50"
+                    )}
+                  >
+                    {seg.text}
+                  </p>
+                </div>
+              ))}
+              <div ref={transcriptEndRef} />
+            </div>
+          </div>
+        )}
+
         <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-b border-line">
           <div className="flex flex-wrap gap-1">
             {tabs.map((t) => (
@@ -233,7 +456,9 @@ export default function ProjectDetail() {
                   <span
                     className={cn(
                       "rounded-pill px-1.5 py-[1px] text-[10.5px] font-semibold",
-                      tab === t.label ? "bg-ink-950 text-white" : "bg-canvas text-ink-950/50"
+                      tab === t.label
+                        ? "bg-ink-950 text-white"
+                        : "bg-canvas text-ink-950/50"
                     )}
                   >
                     {t.count}
@@ -247,11 +472,7 @@ export default function ProjectDetail() {
           </span>
         </div>
 
-        {isEmpty ? (
-          <EmptyState />
-        ) : (
-          <ProjectOverview project={project} />
-        )}
+        {isEmpty ? <EmptyState /> : <ProjectOverview project={project} />}
       </main>
     </>
   );
@@ -332,7 +553,9 @@ function ProjectOverview({ project }) {
       label: "LAST ACTIVITY",
       icon: Clock3,
       value: project.lastActivity?.time || "—",
-      sub: project.lastActivity ? `by ${project.lastActivity.by}` : "No activity yet",
+      sub: project.lastActivity
+        ? `by ${project.lastActivity.by}`
+        : "No activity yet",
     },
   ];
 
@@ -341,7 +564,10 @@ function ProjectOverview({ project }) {
       <div>
         <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
           {stats.map(({ label, icon: Icon, value, sub, bar }) => (
-            <div key={label} className="rounded-card border border-line bg-white p-4">
+            <div
+              key={label}
+              className="rounded-card border border-line bg-white p-4"
+            >
               <div className="flex items-center justify-between">
                 <span className="text-[10.5px] font-semibold tracking-wide text-ink-950/40">
                   {label}
@@ -407,7 +633,10 @@ function ProjectOverview({ project }) {
                     {m.summary}
                   </p>
                 </div>
-                <ChevronRight size={16} className="mt-1 shrink-0 text-ink-950/25" />
+                <ChevronRight
+                  size={16}
+                  className="mt-1 shrink-0 text-ink-950/25"
+                />
               </div>
 
               {m.prsStaged && (
@@ -511,7 +740,10 @@ function ProjectOverview({ project }) {
 
           <div className="mt-3 flex flex-col gap-2">
             {project.topology.nodes.map((n) => (
-              <div key={n.label} className="flex items-center justify-between text-[12px]">
+              <div
+                key={n.label}
+                className="flex items-center justify-between text-[12px]"
+              >
                 <span className="flex items-center gap-1.5 text-ink-950/65">
                   <span className="h-1.5 w-1.5 rounded-full bg-indigo-500" />
                   {n.label}

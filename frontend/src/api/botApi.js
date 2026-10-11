@@ -22,10 +22,20 @@ export async function leaveMeeting({ platform, meetingUrl }) {
   return data;
 }
 
-// URL se platform auto-detect karo (user ko choose karne ki zaroorat nahi)
+// ✅ NAYA — native ID se direct leave
+export async function leaveMeetingNative({ platform, nativeMeetingId }) {
+  const res = await fetch(
+    `${API_BASE}/api/bot/leave-native/${platform}/${nativeMeetingId}`,
+    { method: "POST" }
+  );
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || "Failed to leave meeting");
+  return data;
+}
+
 export function detectPlatform(url) {
   if (/meet\.google\.com/i.test(url)) return "google_meet";
   if (/zoom\.us/i.test(url)) return "zoom";
   if (/teams\.microsoft\.com|teams\.live\.com/i.test(url)) return "teams";
-  return "google_meet"; // fallback
+  return "google_meet";
 }

@@ -1,4 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 requests
+python-dotenv
 pydantic
+websockets==15.0.1
+certifi
+indic-transliteration
