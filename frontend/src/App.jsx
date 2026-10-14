@@ -1,4 +1,6 @@
 import { useState } from "react";
+import Login from "./pages/login";
+import Signup from "./pages/signup";
 import { Routes, Route, useNavigate } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./pages/Dashboard";
@@ -6,7 +8,7 @@ import ProjectsList from "./pages/ProjectsList";
 import ProjectDetail from "./pages/ProjectDetail";
 import InitiateMeetingModal from "./components/modals/InitiateMeetingModal";
 import CreateProjectModal from "./components/modals/CreateProjectModal";
-import SendBotModal from "./components/modals/SendBotModal"; // ✅ NEW
+import SendBotModal from "./components/modals/SendBotModal";
 import { ProjectsProvider, useProjects } from "./context/ProjectsContext";
 
 function Placeholder({ title }) {
@@ -25,8 +27,8 @@ function AppShell() {
   const [initiateOpen, setInitiateOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [sendBotOpen, setSendBotOpen] = useState(false);
-  const [botProject, setBotProject] = useState(null); // ✅ konsa project
-  const { createProject, launchMeeting, getProject } = useProjects();
+  const [botProject, setBotProject] = useState(null);
+  const { createProject, launchMeeting } = useProjects();
   const navigate = useNavigate();
 
   function openInitiate() {
@@ -43,7 +45,6 @@ function AppShell() {
     navigate("/projects");
   }
 
-  // ✅ Jab naya project bane — turant Send Bot kholo us project ke liye
   function handleCreateSubmit(form) {
     const project = createProject(form);
     setCreateOpen(false);
@@ -52,7 +53,6 @@ function AppShell() {
     navigate(`/projects/${project.id}`);
   }
 
-  // ✅ Jab bot successfully join kare — project mein meeting log
   function handleMeetingLaunched(projectId, meetingUrl) {
     launchMeeting(projectId, meetingUrl);
   }
@@ -63,10 +63,7 @@ function AppShell() {
       <div className="pl-[280px]">
         <Routes>
           <Route path="/" element={<Dashboard onInitiateMeeting={openInitiate} />} />
-          <Route
-            path="/projects"
-            element={<ProjectsList onCreateNew={handleCreateNew} />}
-          />
+          <Route path="/projects" element={<ProjectsList onCreateNew={handleCreateNew} />} />
           <Route
             path="/projects/:id"
             element={
@@ -80,10 +77,7 @@ function AppShell() {
           />
           <Route path="/meetings" element={<Placeholder title="Meetings" />} />
           <Route path="/insights" element={<Placeholder title="Insights" />} />
-          <Route
-            path="/documents"
-            element={<Placeholder title="Documents / Outputs" />}
-          />
+          <Route path="/documents" element={<Placeholder title="Documents / Outputs" />} />
         </Routes>
       </div>
 
@@ -100,7 +94,6 @@ function AppShell() {
         onSubmit={handleCreateSubmit}
       />
 
-      {/* ✅ Send Bot Modal — Dono flows yahan aate hain */}
       <SendBotModal
         open={sendBotOpen}
         onClose={() => setSendBotOpen(false)}
@@ -114,7 +107,11 @@ function AppShell() {
 export default function App() {
   return (
     <ProjectsProvider>
-      <AppShell />
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/signup" element={<Signup />} /> {/* 👈 Yeh route add kar diya gaya hai */}
+        <Route path="/*" element={<AppShell />} />
+      </Routes>
     </ProjectsProvider>
   );
 }

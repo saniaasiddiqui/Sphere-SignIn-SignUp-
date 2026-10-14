@@ -4,59 +4,55 @@ import json
 import ssl
 import requests
 import websockets
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from indic_transliteration import sanscript
 from indic_transliteration.sanscript import transliterate
+import jwt
+import datetime
 
 load_dotenv()
 
+# ✅ Sirf aik dafa app initialize karein
+app = FastAPI(title="SPHERE Backend")
 
-def to_hinglish(text, lang):
-    """Hindi/Urdu text ko Roman (Hinglish) mein convert karo."""
-    if not text:
-        return text
+# Secret key for JWT token encoding/decoding
+SECRET_KEY = "sphere_secret_key_12345"
+ALGORITHM = "HS256"
 
-    try:
-        if lang == "hi":
-            result = transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS)
-        elif lang == "ur":
-            result = transliterate(text, sanscript.URDU, sanscript.ITRANS)
-        else:
-            return text
-
-        # ✅ Lowercase + clean spaces
-        result = result.lower()
-        result = " ".join(result.split())
-
-        return result
-    except Exception as e:
-        print(f"Transliteration error: {e}")
-        return text
-
-
-app = FastAPI(title="Meeting Bot Dispatcher")
-
+# ✅ CORS middleware (sab requests ke liye)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Vite frontend & all origins allowed for testing
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Temporary in-memory user database
+fake_users_db = {
+    "ayesha@company.com": "password123"
+}
+
+# Request body validation schemas
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class SignupRequest(BaseModel):
+    fullName: str
+    email: str
+    password: str
 
 class JoinRequest(BaseModel):
     platform: str
     meeting_url: str
 
-
 class LeaveRequest(BaseModel):
     platform: str
     meeting_url: str
-
 
 VEXA_API_KEY = os.getenv("VEXA_API_KEY")
 VEXA_BASE_URL = "https://api.cloud.vexa.ai"
@@ -72,6 +68,94 @@ PLATFORM_MAP = {
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode = ssl.CERT_NONE
+
+
+# ==================== AUTH ENDPOINTS ====================
+@app.post("/api/login")
+async def login(credentials: LoginRequest):
+    if credentials.email in fake_users_db and fake_users_db[credentials.email] == credentials.password:
+        
+        # Token generate karna (expires in 2 hours)
+        expiration = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+        token_payload = {
+            "sub": credentials.email,
+            "exp": expiration
+        }
+        token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
+
+        return {
+            "status": "success",
+            "message": "Login successful",
+            "token": token,
+            "user": {
+                "email": credentials.email,
+                "name": "Ayesha" if credentials.email == "ayesha@company.com" else credentials.email.split("@")[0].capitalize(),
+                "role": "Workspace Admin" if credentials.email == "ayesha@company.com" else "Workspace Member"
+            }
+        }
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid email or password"
+    )
+
+
+@app.post("/api/signup")
+async def signup(credentials: SignupRequest):
+    if not credentials.fullName or not credentials.email or not credentials.password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="All fields are required"
+        )
+    
+    if credentials.email in fake_users_db:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Store user in our database dictionary
+    fake_users_db[credentials.email] = credentials.password
+
+    # Token generate for session setup
+    expiration = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    token_payload = {
+        "sub": credentials.email,
+        "exp": expiration
+    }
+    token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
+
+    return {
+        "status": "success",
+        "message": "User registered successfully",
+        "token": token,
+        "user": {
+            "email": credentials.email,
+            "name": credentials.fullName,
+            "role": "Workspace Member"
+        }
+    }
+
+
+# ==================== TRANSLITERATION HELPER ====================
+def to_hinglish(text, lang):
+    if not text:
+        return text
+
+    try:
+        if lang == "hi":
+            result = transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS)
+        elif lang == "ur":
+            result = transliterate(text, sanscript.URDU, sanscript.ITRANS)
+        else:
+            return text
+
+        result = result.lower()
+        result = " ".join(result.split())
+        return result
+    except Exception as e:
+        print(f"Transliteration error: {e}")
+        return text
 
 
 def extract_native_meeting_id(platform: str, meeting_url: str) -> str:
@@ -107,6 +191,7 @@ def extract_native_meeting_id(platform: str, meeting_url: str) -> str:
     raise ValueError(f"Unsupported platform: {platform}")
 
 
+# ==================== MEETING BOT ENDPOINTS ====================
 @app.post("/api/bot/join")
 async def join_meeting(request: JoinRequest):
     if not VEXA_API_KEY:
@@ -114,9 +199,7 @@ async def join_meeting(request: JoinRequest):
 
     platform = PLATFORM_MAP.get(request.platform.lower())
     if not platform:
-        raise HTTPException(
-            status_code=400, detail=f"Unsupported platform: {request.platform}"
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported platform: {request.platform}")
 
     try:
         native_meeting_id = extract_native_meeting_id(platform, request.meeting_url)
@@ -127,7 +210,7 @@ async def join_meeting(request: JoinRequest):
         "platform": platform,
         "native_meeting_id": native_meeting_id,
         "bot_name": "Sphere",
-        "language": "hi",   # Force Hindi (Urdu ke liye closest, Chinese detection band)
+        "language": "hi",
         "automatic_leave": {
             "max_time_left_alone": 1800000,
             "max_wait_for_admission": 600000,
@@ -175,9 +258,7 @@ async def leave_meeting(request: LeaveRequest):
 
     platform = PLATFORM_MAP.get(request.platform.lower())
     if not platform:
-        raise HTTPException(
-            status_code=400, detail=f"Unsupported platform: {request.platform}"
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported platform: {request.platform}")
 
     try:
         native_meeting_id = extract_native_meeting_id(platform, request.meeting_url)
@@ -238,7 +319,7 @@ async def leave_meeting_native(platform: str, native_meeting_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ✅ WebSocket endpoint for live transcript (with Hinglish transliteration)
+# ==================== WEBSOCKET ENDPOINT ====================
 @app.websocket("/ws/transcript/{platform}/{native_meeting_id}")
 async def transcript_websocket(
     websocket: WebSocket, platform: str, native_meeting_id: str
@@ -270,17 +351,13 @@ async def transcript_websocket(
                     data = json.loads(message)
                     msg_type = data.get("type")
 
-                    # ✅ TRANSCRIPT — Hindi/Urdu → Hinglish
                     if msg_type == "transcript":
-
-                        # Format 1: Single segment
                         if data.get("segment"):
                             seg = data["segment"]
                             original = seg.get("text", "")
                             seg["original_text"] = original
                             seg["text"] = to_hinglish(original, seg.get("language"))
 
-                        # Format 2: confirmed + pending
                         for key in ("confirmed", "pending"):
                             if data.get(key) and isinstance(data[key], list):
                                 for s in data[key]:
@@ -288,7 +365,6 @@ async def transcript_websocket(
                                     s["original_text"] = original
                                     s["text"] = to_hinglish(original, s.get("language"))
 
-                        # Format 3: segments array
                         if data.get("segments") and isinstance(data["segments"], list):
                             for s in data["segments"]:
                                 original = s.get("text", "")
